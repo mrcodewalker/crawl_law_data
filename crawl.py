@@ -387,9 +387,14 @@ def worker(cfg: dict):
     # Resume: lấy trang đã làm dở từ state
     state = load_state()
     resume_page = state.get(str(wid))
-    if resume_page and resume_page > page_start:
-        log.info("Worker %d resume từ trang %d (state)", wid, resume_page)
-        page_start = resume_page
+    if resume_page:
+        if resume_page > page_end:
+            log.info("Worker %d đã hoàn thành range (state=%d > page_end=%d), bỏ qua.",
+                     wid, resume_page, page_end)
+            return
+        if resume_page > page_start:
+            log.info("Worker %d resume từ trang %d (state)", wid, resume_page)
+            page_start = resume_page
 
     driver = make_driver()
     log.info("Worker %d khởi động (trang %d–%d → %s/)", wid, page_start, page_end, out_folder)
@@ -404,9 +409,9 @@ def worker(cfg: dict):
             doc_urls = get_doc_urls_from_search_page(driver, page)
 
             if not doc_urls:
-                log.warning("[W%d] Trang %d rỗng, thử trang tiếp.", wid, page)
-                time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-                save_state(wid, page + 1)
+                log.warning("[W%d] Trang %d rỗng — tạm dừng, KHÔNG chuyển trang.", wid, page)
+                # Không save_state, không tăng page → retry trang này lần sau
+                time.sleep(random.uniform(10, 20))
                 continue
 
             for url in doc_urls:
@@ -420,7 +425,16 @@ def worker(cfg: dict):
                     _visited.add(url)
 
                 log.info("  [W%d] → %s", wid, url.split("/")[-1][:60])
-                ok = scrape_doc_in_new_tab(driver, url, out_folder)
+                try:
+                    ok = scrape_doc_in_new_tab(driver, url, out_folder)
+                except Exception as e:
+                    err = str(e)
+                    if "disconnected" in err.lower() or "connection" in err.lower() or "target closed" in err.lower():
+                        log.error("Worker %d: Browser bị đóng trong lúc scrape — dừng.", wid)
+                        _done_event.set()
+                        break
+                    log.warning("  [W%d] scrape lỗi: %s", wid, e)
+                    ok = False
                 if ok:
                     doc_count += 1
 
@@ -436,9 +450,17 @@ def worker(cfg: dict):
             time.sleep(random.uniform(DELAY_MIN, DELAY_MAX + 2))
 
     except Exception as e:
-        log.error("Worker %d lỗi nghiêm trọng: %s", wid, e)
+        err = str(e)
+        if "disconnected" in err.lower() or "connection" in err.lower() or "target closed" in err.lower():
+            log.error("Worker %d: Browser bị đóng — dừng toàn bộ chương trình.", wid)
+            _done_event.set()
+        else:
+            log.error("Worker %d lỗi nghiêm trọng: %s", wid, e)
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
         log.info("Worker %d dừng. Đã crawl %d văn bản.", wid, doc_count)
 
 
@@ -478,8 +500,13 @@ def crawl(reset: bool = False):
             time.sleep(5)  # stagger Chrome
 
     try:
-        for t in threads:
-            t.join()
+        while any(t.is_alive() for t in threads):
+            if _done_event.is_set():
+                log.info("Phát hiện tín hiệu dừng — thoát chương trình.")
+                for t in threads:
+                    t.join(timeout=3)
+                break
+            time.sleep(1)
     except KeyboardInterrupt:
         log.info("Dừng bởi người dùng.")
         _done_event.set()
@@ -487,7 +514,6 @@ def crawl(reset: bool = False):
             t.join(timeout=5)
 
     log.info("Hoàn thành.")
-
 
 if __name__ == "__main__":
     crawl(reset="--reset" in sys.argv)
