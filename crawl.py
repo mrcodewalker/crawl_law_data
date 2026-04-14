@@ -6,38 +6,55 @@ import random
 import logging
 import re
 import threading
-from queue import Queue, Empty
+import base64
 from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError
 
+try:
+    import ddddocr
+    _ocr = ddddocr.DdddOcr(show_ad=False)
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    log_tmp = logging.getLogger(__name__)
+    log_tmp.warning("ddddocr chưa cài — captcha sẽ cần xử lý thủ công. Cài: pip install ddddocr")
+
 # ── Config ──────────────────────────────────────────────────────────────────
-START_URL = "https://thuvienphapluat.vn/van-ban/Giao-thong-Van-tai/Nghi-dinh-89-2026-ND-CP-dieu-kien-kinh-doanh-dich-vu-kiem-dinh-xe-co-gioi-688213.aspx"
-OUTPUT_DIR = "output"
-VISITED_FILE = "visited.json"
-DATA_FILE = "data.jsonl"
-HTML_FILE = "html.jsonl"
+SEARCH_BASE_URL = (
+    "https://thuvienphapluat.vn/page/tim-van-ban.aspx"
+    "?keyword=&area=0&match=True&type=0&status=0&signer=0"
+    "&edate=13/04/2026&sort=1&lan=1&scan=0&org=1&fields="
+)
+
+OUTPUT_DIR     = "output"
+VISITED_FILE   = "visited.json"
+DATA_FILE      = "data.jsonl"
+HTML_FILE      = "html.jsonl"
+STATE_FILE     = "state.json"   # lưu trang hiện tại của mỗi worker để resume
 SAVE_HTML_FILE = True
-DELAY_MIN = 3          # giây nghỉ tối thiểu sau mỗi URL
-DELAY_MAX = 7          # giây nghỉ tối đa
-BATCH_SIZE = 2         # mỗi worker crawl bao nhiêu URL rồi nghỉ dài
-BATCH_PAUSE_MIN = 5    # nghỉ tối thiểu sau mỗi batch
-BATCH_PAUSE_MAX = 12   # nghỉ tối đa sau mỗi batch
-IDLE_TIMEOUT = 60      # giây chờ URL mới trước khi worker tự dừng
-MAX_DOCS = 100
-NUM_WORKERS = 3
-INCLUDE_HREF = False   # True: giữ href trong HTML output
+INCLUDE_HREF   = False
+
+DELAY_MIN       = 2
+DELAY_MAX       = 5
+BATCH_SIZE      = 3    # số bài rồi nghỉ dài
+BATCH_PAUSE_MIN = 6
+BATCH_PAUSE_MAX = 14
+
+# Worker 1: trang 1→100   → output/0-100/
+# Worker 2: trang 101→200 → output/101-200/
+WORKERS = [
+    {"id": 1, "page_start": 1,   "page_end": 100, "out_folder": "0-100"},
+    {"id": 2, "page_start": 101, "page_end": 200, "out_folder": "101-200"},
+]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 # ── Shared state ─────────────────────────────────────────────────────────────
 _visited_lock = threading.Lock()
-_write_lock = threading.Lock()
-_counter_lock = threading.Lock()
+_write_lock   = threading.Lock()
 _visited: set = set()
-_counter: int = 0
-_url_queue: Queue = Queue()
-_done_event = threading.Event()  # set khi đạt MAX_DOCS hoặc queue cạn hẳn
+_done_event   = threading.Event()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -53,15 +70,34 @@ def save_visited():
         json.dump(list(_visited), f, ensure_ascii=False, indent=2)
 
 
-def append_data(record: dict):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(os.path.join(OUTPUT_DIR, DATA_FILE), "a", encoding="utf-8") as f:
+# ── State (resume) ────────────────────────────────────────────────────────────
+def load_state() -> dict:
+    """Trả về dict {worker_id: current_page}"""
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(worker_id: int, page: int):
+    with _write_lock:
+        state = load_state()
+        state[str(worker_id)] = page
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+
+
+def append_data(record: dict, out_folder: str):
+    d = os.path.join(OUTPUT_DIR, out_folder)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, DATA_FILE), "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def append_html(record: dict):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(os.path.join(OUTPUT_DIR, HTML_FILE), "a", encoding="utf-8") as f:
+def append_html_record(record: dict, out_folder: str):
+    d = os.path.join(OUTPUT_DIR, out_folder)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, HTML_FILE), "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -74,30 +110,119 @@ def make_driver() -> ChromiumPage:
     return ChromiumPage(addr_or_opts=opts)
 
 
-# ── Core scraping ─────────────────────────────────────────────────────────────
-def clean_content_html(driver: ChromiumPage) -> str:
+def search_url(page: int) -> str:
+    return f"{SEARCH_BASE_URL}&page={page}"
+
+
+# ── Cloudflare wait ───────────────────────────────────────────────────────────
+def wait_cloudflare(driver: ChromiumPage, label: str = ""):
+    cf_warned = False
+    for _ in range(60):
+        t = driver.title
+        if "Just a moment" in t or "Checking your browser" in t:
+            if not cf_warned:
+                log.warning("  ⚠ Cloudflare%s — vui lòng click checkbox...",
+                             f" [{label}]" if label else "")
+                cf_warned = True
+            time.sleep(2)
+        else:
+            if cf_warned:
+                log.info("  ✓ Đã qua Cloudflare")
+            break
+
+
+def solve_captcha_image(driver: ChromiumPage) -> str:
+    """Lấy ảnh captcha từ /RegistImage.aspx và OCR bằng ddddocr."""
     try:
-        driver.run_js("""
-            ['.__mucluc', '.NoiDungChiaSe', '#hdsdcondau', 'script'].forEach(sel => {
+        img_b64: str = driver.run_js("""
+            var img = document.querySelector("img[src*='RegistImage']");
+            if (!img) return '';
+            var canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth || img.width;
+            canvas.height = img.naturalHeight || img.height;
+            canvas.getContext('2d').drawImage(img, 0, 0);
+            return canvas.toDataURL('image/png').split(',')[1];
+        """)
+        if not img_b64:
+            return ""
+        img_bytes = base64.b64decode(img_b64)
+        if OCR_AVAILABLE:
+            result = _ocr.classification(img_bytes)
+            log.info("  OCR captcha: '%s'", result)
+            return result.strip().upper()
+    except Exception as e:
+        log.debug("solve_captcha_image lỗi: %s", e)
+    return ""
+
+
+def handle_captcha(driver: ChromiumPage) -> bool:
+    """
+    Kiểm tra và xử lý captcha Robot của thuvienphapluat.
+    Trả về True nếu pass (hoặc không có captcha).
+    """
+    try:
+        robot_el = driver.ele("css:td[colspan='3']", timeout=2)
+        if not robot_el or "Robot" not in (robot_el.text or ""):
+            return True
+    except Exception:
+        return True
+
+    log.warning("  ⚠ Phát hiện captcha Robot — đang OCR...")
+    for attempt in range(3):
+        code = solve_captcha_image(driver)
+        if not code:
+            log.warning("  OCR thất bại lần %d, chờ 3s...", attempt + 1)
+            time.sleep(3)
+            driver.refresh()
+            time.sleep(2)
+            continue
+        try:
+            inp = driver.ele("#ctl00_Content_txtSecCode", timeout=3)
+            btn = driver.ele("#ctl00_Content_CheckButton", timeout=3)
+            if inp and btn:
+                inp.clear()
+                inp.input(code)
+                btn.click()
+                time.sleep(2)
+                robot_check = driver.ele("css:td[colspan='3']", timeout=2)
+                if not robot_check or "Robot" not in (robot_check.text or ""):
+                    log.info("  ✓ Captcha giải thành công")
+                    return True
+                log.warning("  Captcha sai lần %d, thử lại...", attempt + 1)
+                time.sleep(2)
+        except Exception as e:
+            log.debug("handle_captcha submit lỗi: %s", e)
+
+    log.warning("  ✗ Không giải được captcha sau 3 lần, chờ 30s...")
+    time.sleep(30)
+    return False
+
+
+def clean_content_html(tab: ChromiumPage) -> str:
+    try:
+        tab.run_js("""
+            ['.__mucluc','.NoiDungChiaSe','#hdsdcondau','script'].forEach(sel => {
                 document.querySelectorAll('#tab1 ' + sel).forEach(el => el.remove());
             });
         """)
-        raw_html: str = driver.run_js(
-            "var el=document.getElementById('tab1'); return el ? el.outerHTML : '';"
+        raw: str = tab.run_js(
+            "var e=document.getElementById('tab1'); return e ? e.outerHTML : '';"
         )
-        if not raw_html:
+        if not raw:
             return ""
-        raw_html = re.sub(r'<!--.*?-->', '', raw_html, flags=re.DOTALL)
-        raw_html = re.sub(r'\s+on\w+="[^"]*"', '', raw_html)
-        raw_html = re.sub(r"\s+on\w+='[^']*'", '', raw_html)
-        raw_html = re.sub(r'\s*background-image\s*:\s*url\((?:&quot;|\'|")?[^)]*(?:&quot;|\'|")?\)\s*;?', '', raw_html)
+        raw = re.sub(r'<!--.*?-->', '', raw, flags=re.DOTALL)
+        raw = re.sub(r'\s+on\w+="[^"]*"', '', raw)
+        raw = re.sub(r"\s+on\w+='[^']*'", '', raw)
+        raw = re.sub(
+            r'\s*background-image\s*:\s*url\((?:&quot;|\'|")?[^)]*(?:&quot;|\'|")?\)\s*;?',
+            '', raw)
         if not INCLUDE_HREF:
-            raw_html = re.sub(r'\s+href="[^"]*"', '', raw_html)
-            raw_html = re.sub(r"\s+href='[^']*'", '', raw_html)
-        raw_html = re.sub(r'\n{3,}', '\n\n', raw_html)
-        return raw_html.strip()
+            raw = re.sub(r'\s+href="[^"]*"', '', raw)
+            raw = re.sub(r"\s+href='[^']*'", '', raw)
+        raw = re.sub(r'\n{3,}', '\n\n', raw)
+        return raw.strip()
     except Exception as e:
-        log.debug("clean_content_html lỗi: %s", e)
+        log.debug("clean_content_html: %s", e)
         return ""
 
 
@@ -110,14 +235,14 @@ def build_full_html(title: str, content_html: str) -> str:
 <title>{title}</title>
 <style>
   body {{ font-family: Arial, sans-serif; background: #f5f5f5; margin: 0; padding: 20px; }}
-  #tab1 {{ width: 100% !important; max-width: 900px !important; margin: 0 auto !important;
-           background: #fff; padding: 30px !important; box-sizing: border-box; }}
-  #divContentDoc, .cldivContentDocVn {{ width: 100% !important; float: none !important; margin: 0 !important; }}
-  #ctl00_Content_ThongTinVB_pnlDocContent {{ width: 100% !important; }}
+  #tab1 {{ width:100% !important; max-width:900px !important; margin:0 auto !important;
+           background:#fff; padding:30px !important; box-sizing:border-box; }}
+  #divContentDoc, .cldivContentDocVn {{ width:100% !important; float:none !important; margin:0 !important; }}
+  #ctl00_Content_ThongTinVB_pnlDocContent {{ width:100% !important; }}
   #divContentDoc > div > div > table:first-of-type,
-  .content1 > div > div > table:first-of-type {{ width: 100% !important; }}
+  .content1 > div > div > table:first-of-type {{ width:100% !important; }}
   #divContentDoc > div > div > table:first-of-type td,
-  .content1 > div > div > table:first-of-type td {{ width: 50% !important; }}
+  .content1 > div > div > table:first-of-type td {{ width:50% !important; }}
 </style>
 </head>
 <body>
@@ -126,18 +251,17 @@ def build_full_html(title: str, content_html: str) -> str:
 </html>"""
 
 
-def save_html_file(title: str, content_html: str):
-    html_dir = os.path.join(OUTPUT_DIR, "html")
-    os.makedirs(html_dir, exist_ok=True)
-    safe_name = re.sub(r'[\\/*?:"<>|]', '', title).strip()[:120] or "van_ban"
-    with open(os.path.join(html_dir, safe_name + ".html"), "w", encoding="utf-8") as f:
+def save_html_file(title: str, content_html: str, out_folder: str):
+    d = os.path.join(OUTPUT_DIR, out_folder)
+    os.makedirs(d, exist_ok=True)
+    safe = re.sub(r'[\\/*?:"<>|]', '', title).strip()[:120] or "van_ban"
+    with open(os.path.join(d, safe + ".html"), "w", encoding="utf-8") as f:
         f.write(build_full_html(title, content_html))
-    log.info("  → Đã lưu HTML: %s", safe_name)
+    log.info("    → Lưu: %s", safe[:60])
 
 
-def scrape_metadata(driver: ChromiumPage) -> dict:
-    meta = {}
-    label_map = {
+def scrape_metadata(tab: ChromiumPage) -> dict:
+    meta, label_map = {}, {
         "Số hiệu": "so_hieu", "Loại văn bản": "loai_van_ban",
         "Nơi ban hành": "noi_ban_hanh", "Người ký": "nguoi_ky",
         "Ngày ban hành": "ngay_ban_hanh", "Ngày hiệu lực": "ngay_hieu_luc",
@@ -145,193 +269,213 @@ def scrape_metadata(driver: ChromiumPage) -> dict:
         "Cập nhật": "cap_nhat", "Lĩnh vực": "linh_vuc",
     }
     try:
-        rows = driver.eles("css:.right-col tr, .box-thuoc-tinh tr, .thuoc-tinh tr, #tab2 tr")
+        rows = tab.eles("css:.right-col tr, .box-thuoc-tinh tr, .thuoc-tinh tr, #tab2 tr")
         for row in rows:
             try:
                 cells = row.eles("tag:td")
                 if len(cells) >= 2:
-                    label = cells[0].text.strip().rstrip(":")
-                    key = label_map.get(label)
+                    key = label_map.get(cells[0].text.strip().rstrip(":"))
                     if key:
                         meta[key] = cells[1].text.strip()
             except Exception:
                 continue
     except Exception as e:
-        log.debug("scrape_metadata lỗi: %s", e)
+        log.debug("scrape_metadata: %s", e)
     return meta
 
 
-def scrape_page(driver: ChromiumPage, url: str) -> tuple[dict | None, dict | None]:
+# ── Scrape 1 văn bản trong tab mới ───────────────────────────────────────────
+def scrape_doc_in_new_tab(driver: ChromiumPage, url: str, out_folder: str) -> bool:
+    """Mở tab mới, scrape, đóng tab. Tab gốc (search) không bị ảnh hưởng."""
+    tab = None
+    try:
+        tab = driver.new_tab(url)
+        tab.wait.doc_loaded(timeout=30)
+        wait_cloudflare(tab, url.split("/")[-1][:40])
+
+        if not tab.ele("#tab1", timeout=30):
+            log.warning("  Không tìm thấy #tab1: %s", url)
+            return False
+
+        title = ""
+        el = tab.ele("css:h1.title-vb, h1", timeout=3)
+        if el:
+            title = el.text.strip()
+
+        meta       = scrape_metadata(tab)
+        content_el = tab.ele("css:#tab1", timeout=3)
+        raw_html   = clean_content_html(tab)
+        doc_title  = title or url.split("/")[-1]
+
+        data_record = {
+            "url": url, "title": title,
+            "content": content_el.text.strip() if content_el else "",
+            "meta": meta,
+        }
+        html_record = {
+            "url": url, "title": title,
+            "content_html": build_full_html(doc_title, raw_html),
+        }
+        html_record.update(meta)
+
+        with _write_lock:
+            append_data(data_record, out_folder)
+            append_html_record(html_record, out_folder)
+            save_visited()
+
+        if SAVE_HTML_FILE and raw_html:
+            save_html_file(doc_title, raw_html, out_folder)
+
+        return True
+
+    except Exception as e:
+        log.warning("  scrape_doc lỗi %s: %s", url, e)
+        return False
+    finally:
+        if tab:
+            try:
+                tab.close()
+            except Exception:
+                pass
+
+
+# ── Lấy URL văn bản từ trang search (tab gốc) ────────────────────────────────
+def get_doc_urls_from_search_page(driver: ChromiumPage, page: int) -> list[str]:
+    url = search_url(page)
     try:
         driver.get(url)
-        cf_warned = False
-        for _ in range(60):
-            t = driver.title
-            if "Just a moment" in t or "Checking your browser" in t:
-                if not cf_warned:
-                    log.warning("  ⚠ [%s] Cloudflare — vui lòng click checkbox...", url.split("/")[-1][:40])
-                    cf_warned = True
-                time.sleep(2)
-            else:
-                if cf_warned:
-                    log.info("  ✓ Đã qua Cloudflare")
+        wait_cloudflare(driver, f"search p={page}")
+        # Xử lý captcha nếu có
+        if not handle_captcha(driver):
+            log.warning("Bỏ qua trang %d do captcha không giải được.", page)
+            return []
+        # Chờ danh sách kết quả load — thử nhiều selector
+        for sel in ["css:.result-item", "css:.list-vb li", "css:.nqTitle",
+                    "css:a[href*='/van-ban/'][href*='.aspx']"]:
+            el = driver.ele(sel, timeout=10)
+            if el:
                 break
-        if not driver.ele("#tab1", timeout=30):
-            log.warning("Không tìm thấy #tab1: %s", url)
-            return None, None
+        time.sleep(1)
     except Exception as e:
-        log.warning("Lỗi tải %s: %s", url, e)
-        return None, None
+        log.warning("Không tải được trang search p=%d: %s", page, e)
+        return []
 
-    title = ""
-    el = driver.ele("css:h1.title-vb, h1", timeout=3)
-    if el:
-        title = el.text.strip()
-
-    meta = scrape_metadata(driver)
-    data_record: dict = {"url": url, "title": title}
-    content_el = driver.ele("css:#tab1", timeout=3)
-    data_record["content"] = content_el.text.strip() if content_el else ""
-    data_record["meta"] = meta
-
-    raw_html = clean_content_html(driver)
-    doc_title = title or url.split("/")[-1]
-    html_record: dict = {"url": url, "title": title,
-                         "content_html": build_full_html(doc_title, raw_html)}
-    html_record.update(meta)
-    if SAVE_HTML_FILE and raw_html:
-        save_html_file(doc_title, raw_html)
-
-    return data_record, html_record
-
-
-def collect_related_urls(driver: ChromiumPage) -> list[str]:
     urls, seen = [], set()
-    selectors = [".GridBaseVBCT .nqTitle a", ".GridBaseVBCT a",
-                 ".vb-related a", ".list-vb a", "a[href*='/van-ban/']"]
+    # Selector rộng: bắt mọi link /van-ban/*.aspx trên trang
     try:
-        for sel in selectors:
-            for a in driver.eles(f"css:{sel}"):
-                href = a.attr("href") or ""
-                if "thuvienphapluat.vn/van-ban/" in href and ".aspx" in href:
-                    clean = href.split("?")[0].split("#")[0]
-                    if clean not in seen:
-                        seen.add(clean)
-                        urls.append(clean)
+        for a in driver.eles("css:a[href*='/van-ban/']"):
+            href = a.attr("href") or ""
+            if ".aspx" in href and "thuvienphapluat.vn/van-ban/" in href:
+                clean = href.split("?")[0].split("#")[0]
+                if clean not in seen:
+                    seen.add(clean)
+                    urls.append(clean)
     except Exception as e:
-        log.debug("collect_related_urls lỗi: %s", e)
+        log.debug("get_doc_urls: %s", e)
+
+    log.info("  [search p=%d] %d URL văn bản", page, len(urls))
     return urls
 
 
 # ── Worker ────────────────────────────────────────────────────────────────────
-def worker(worker_id: int):
-    global _counter
+def worker(cfg: dict):
+    wid        = cfg["id"]
+    out_folder = cfg["out_folder"]
+    page_start = cfg["page_start"]
+    page_end   = cfg["page_end"]
+
+    # Resume: lấy trang đã làm dở từ state
+    state = load_state()
+    resume_page = state.get(str(wid))
+    if resume_page and resume_page > page_start:
+        log.info("Worker %d resume từ trang %d (state)", wid, resume_page)
+        page_start = resume_page
+
     driver = make_driver()
-    log.info("Worker %d khởi động.", worker_id)
-    batch_count = 0  # đếm số URL đã làm trong batch hiện tại
+    log.info("Worker %d khởi động (trang %d–%d → %s/)", wid, page_start, page_end, out_folder)
+    doc_count = 0
 
     try:
-        while not _done_event.is_set():
-            # Lấy URL từ queue, chờ tối đa IDLE_TIMEOUT giây
-            try:
-                url = _url_queue.get(timeout=IDLE_TIMEOUT)
-            except Empty:
-                log.info("Worker %d: không có URL mới sau %ds, dừng.", worker_id, IDLE_TIMEOUT)
-                break
-
-            # Kiểm tra đã visited chưa (atomic check-and-mark)
-            with _visited_lock:
-                if url in _visited:
-                    _url_queue.task_done()
-                    continue
-                _visited.add(url)
-
-            # Kiểm tra giới hạn
-            with _counter_lock:
-                if MAX_DOCS and _counter >= MAX_DOCS:
-                    _done_event.set()
-                    _url_queue.task_done()
-                    break
-
-            log.info("[W%d] Crawling: %s", worker_id, url.split("/")[-1][:60])
-            data_record, html_record = scrape_page(driver, url)
-
-            if data_record:
-                # Thu thập URL liên quan trước khi ghi
-                related = collect_related_urls(driver)
-
-                with _write_lock:
-                    append_data(data_record)
-                    append_html(html_record)
-                    save_visited()
-
-                with _counter_lock:
-                    _counter += 1
-                    current = _counter
-                    if MAX_DOCS and _counter >= MAX_DOCS:
-                        _done_event.set()
-
-                log.info("  [W%d] ✓ %d/%s — %s", worker_id, current,
-                         str(MAX_DOCS) if MAX_DOCS else "∞",
-                         data_record.get("title", url)[:60])
-
-                # Thêm URL mới vào queue (chỉ những URL chưa visited)
-                with _visited_lock:
-                    new_urls = [u for u in related if u not in _visited]
-                random.shuffle(new_urls)
-                for u in new_urls:
-                    if not _done_event.is_set():
-                        _url_queue.put(u)
-                if new_urls:
-                    log.info("  [W%d] → %d URL mới vào queue", worker_id, len(new_urls))
-
-            _url_queue.task_done()
-            batch_count += 1
-
+        for page in range(page_start, page_end + 1):
             if _done_event.is_set():
                 break
 
-            # Sau mỗi BATCH_SIZE URL, nghỉ dài hơn để tránh bị detect
-            if batch_count % BATCH_SIZE == 0:
-                pause = random.uniform(BATCH_PAUSE_MIN, BATCH_PAUSE_MAX)
-                log.info("  [W%d] Nghỉ batch %.1fs...", worker_id, pause)
-                time.sleep(pause)
-            else:
+            log.info("[W%d] === Trang tìm kiếm %d ===", wid, page)
+            doc_urls = get_doc_urls_from_search_page(driver, page)
+
+            if not doc_urls:
+                log.warning("[W%d] Trang %d rỗng, thử trang tiếp.", wid, page)
                 time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                save_state(wid, page + 1)
+                continue
+
+            for url in doc_urls:
+                if _done_event.is_set():
+                    break
+
+                with _visited_lock:
+                    if url in _visited:
+                        log.debug("  [W%d] Bỏ qua (đã crawl): %s", wid, url.split("/")[-1][:50])
+                        continue
+                    _visited.add(url)
+
+                log.info("  [W%d] → %s", wid, url.split("/")[-1][:60])
+                ok = scrape_doc_in_new_tab(driver, url, out_folder)
+                if ok:
+                    doc_count += 1
+
+                if doc_count % BATCH_SIZE == 0:
+                    pause = random.uniform(BATCH_PAUSE_MIN, BATCH_PAUSE_MAX)
+                    log.info("  [W%d] Nghỉ batch %.1fs...", wid, pause)
+                    time.sleep(pause)
+                else:
+                    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+
+            # Lưu state sau khi xong 1 trang
+            save_state(wid, page + 1)
+            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX + 2))
 
     except Exception as e:
-        log.error("Worker %d lỗi nghiêm trọng: %s", worker_id, e)
+        log.error("Worker %d lỗi nghiêm trọng: %s", wid, e)
     finally:
         driver.quit()
-        log.info("Worker %d dừng. Đã xử lý %d URL.", worker_id, batch_count)
+        log.info("Worker %d dừng. Đã crawl %d văn bản.", wid, doc_count)
 
 
-# ── Main crawler ──────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def crawl(reset: bool = False):
-    global _visited, _counter
+    global _visited
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for cfg in WORKERS:
+        os.makedirs(os.path.join(OUTPUT_DIR, cfg["out_folder"]), exist_ok=True)
 
     if reset:
-        for f in [VISITED_FILE, os.path.join(OUTPUT_DIR, DATA_FILE),
-                  os.path.join(OUTPUT_DIR, HTML_FILE)]:
-            if os.path.exists(f):
-                os.remove(f)
-                log.info("Đã xóa: %s", f)
+        if os.path.exists(VISITED_FILE):
+            os.remove(VISITED_FILE)
+            log.info("Đã xóa: %s", VISITED_FILE)
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+            log.info("Đã xóa: %s", STATE_FILE)
+        for cfg in WORKERS:
+            folder = os.path.join(OUTPUT_DIR, cfg["out_folder"])
+            for fname in [DATA_FILE, HTML_FILE]:
+                fpath = os.path.join(folder, fname)
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+                    log.info("Đã xóa: %s", fpath)
 
     _visited = load_visited()
-    _counter = 0
     _done_event.clear()
-    _url_queue.put(START_URL)
 
-    # Khởi động workers, stagger 3s để tránh 3 Chrome mở cùng lúc
     threads = []
-    for i in range(NUM_WORKERS):
-        t = threading.Thread(target=worker, args=(i + 1,), daemon=True, name=f"worker-{i+1}")
+    for i, cfg in enumerate(WORKERS):
+        t = threading.Thread(target=worker, args=(cfg,), daemon=True,
+                             name=f"worker-{cfg['id']}")
         t.start()
         threads.append(t)
-        if i < NUM_WORKERS - 1:
-            time.sleep(3)
+        if i < len(WORKERS) - 1:
+            time.sleep(5)  # stagger Chrome
 
     try:
         for t in threads:
@@ -342,9 +486,8 @@ def crawl(reset: bool = False):
         for t in threads:
             t.join(timeout=5)
 
-    log.info("Hoàn thành. Đã crawl %d văn bản.", _counter)
+    log.info("Hoàn thành.")
 
 
 if __name__ == "__main__":
-    reset_flag = "--reset" in sys.argv
-    crawl(reset=reset_flag)
+    crawl(reset="--reset" in sys.argv)
